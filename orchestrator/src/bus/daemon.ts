@@ -40,6 +40,8 @@ import type { WorkspaceStore } from "../store/workspace-store.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 60_000;
 const OPERATOR_INSTANCE_ID = "operator";
+/** Lease window. Renewed by every `busy` heartbeat, so it only lapses if the holder goes quiet. */
+const LEASE_MS = 10 * 60_000;
 const MAX_ASK_TIMEOUT_MS = 600_000;
 const MAX_BODY_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -387,7 +389,7 @@ export class CoordinationBus {
 			}
 			case "task.claim": {
 				const requested = payload as { taskId?: string };
-				const task = this.board.claim(String(requested?.taskId ?? ""), instanceId, 10 * 60_000);
+				const task = this.board.claim(String(requested?.taskId ?? ""), instanceId, LEASE_MS);
 				this.setInstanceTask(instanceId, task.id);
 				this.broadcast("task.changed", { task: summarizeTask(task), reason: "claimed" });
 				this.reply(connection, id, true, { task: summarizeTask(task) });
@@ -558,6 +560,12 @@ export class CoordinationBus {
 			model: nextModel,
 			lastHeartbeatAt: new Date().toISOString(),
 		});
+		// A live heartbeat is proof the holder is still there, so renew the lease on whatever it is
+		// working on. Without this, any task that runs longer than the lease window gets reaped out
+		// from under an agent that is doing exactly what it was asked to do.
+		if (state === "busy" && instance.currentTaskId) {
+			this.board.renewLease(instance.currentTaskId, instanceId, LEASE_MS);
+		}
 		if (changedModel) {
 			this.store.appendLedger({ kind: "instance.model_changed", instanceId, from: instance.model, to: nextModel });
 			this.broadcast("fleet.snapshot", this.snapshot());
@@ -698,7 +706,59 @@ export class CoordinationBus {
 			subject: review.taskId,
 			requiresAck: true,
 		});
+		// Advance the task now that a verdict is in. Without this the merge lane never sees the
+		// task, because it only drains tasks in `done` (PLAN.md §3.4: approve -> quorum met ->
+		// task done -> MergeLane). Found by running the fleet: a review was approved and nothing
+		// happened for the next ten minutes.
+		this.applyReviewOutcome(review.taskId, verdict, instanceId);
 		return review;
+	}
+
+	/**
+	 * Decide what a verdict does to the task.
+	 *
+	 * `approve` moves it to `done` only when the quorum is satisfied: every requested review has a
+	 * verdict, at least one approves, none requested changes or escalated, and the approval did not
+	 * come solely from the author. The merge lane re-checks all of this at merge time (§3.8), so
+	 * this is the routing decision, not the safety gate.
+	 */
+	private applyReviewOutcome(taskId: string, verdict: Review["verdict"], by: string): void {
+		const task = this.store.readTask(taskId);
+		if (!task) return;
+		if (verdict === "request_changes") {
+			if (task.status === "in_review") {
+				this.board.transition(taskId, "changes_requested", by, { note: `review requested changes` });
+				this.broadcast("task.changed", { task: summarizeTask(this.store.readTask(taskId) as Task), reason: "changes_requested" });
+			}
+			return;
+		}
+		if (verdict === "escalate") {
+			this.postMessage({
+				from: by,
+				to: "parent",
+				kind: "escalation",
+				body: `A reviewer escalated ${taskId} instead of judging it. Decide whether it should merge.`,
+				subject: taskId,
+				requiresAck: true,
+			});
+			return;
+		}
+		if (verdict !== "approve") return;
+		const outcome = reviewQuorumMet(this.store.listReviews(taskId), task.createdBy, task.assignee);
+		if (!outcome.met) {
+			this.store.appendLedger({ kind: "review.quorum_unmet", taskId, reason: outcome.reason });
+			return;
+		}
+		if (task.status !== "in_review") return;
+		const done = this.board.transition(taskId, "done", "daemon", { note: `review quorum met: ${outcome.reason}` });
+		this.broadcast("task.changed", { task: summarizeTask(done), reason: "approved" });
+		this.store.writeDecision("review.approved", "daemon", `${taskId} approved by ${by}; marked done`, {
+			taskId,
+			reviewer: by,
+			reason: outcome.reason,
+		});
+		// The merge lane drains on the next tick, and immediately here so the operator sees movement.
+		this.onEvent?.({ type: "task-ready" });
 	}
 
 	private handleUsageReport(instanceId: string, payload: unknown): void {
@@ -799,6 +859,33 @@ export class CoordinationBus {
 		this.reply(connection, id, true, answer);
 	}
 
+	/**
+	 * Re-evaluate tasks sitting in `in_review` whose reviews are all in.
+	 *
+	 * Called from the daemon tick so the handoff survives a daemon restart mid-review: without it,
+	 * a verdict recorded while the daemon was down would leave the task parked in `in_review`
+	 * forever and the merge lane would never see it.
+	 */
+	reconcileReviews(): string[] {
+		const advanced: string[] = [];
+		for (const task of this.board.list()) {
+			if (task.status !== "in_review") continue;
+			const reviews = this.store.listReviews(task.id);
+			if (reviews.length === 0) continue;
+			const outcome = reviewQuorumMet(reviews, task.createdBy, task.assignee);
+			if (!outcome.met) continue;
+			const done = this.board.transition(task.id, "done", "daemon", { note: `review quorum met: ${outcome.reason}` });
+			this.broadcast("task.changed", { task: summarizeTask(done), reason: "approved" });
+			this.store.writeDecision("review.approved", "daemon", `${task.id} approved; marked done (reconciled)`, {
+				taskId: task.id,
+				reason: outcome.reason,
+			});
+			advanced.push(task.id);
+		}
+		if (advanced.length > 0) this.onEvent?.({ type: "task-ready" });
+		return advanced;
+	}
+
 	// -- daemon-side helpers used by the fleet manager -----------------------
 
 	/** Push a message that came from the daemon/parent rather than from a peer. */
@@ -849,6 +936,36 @@ function summarizeTask(task: Task): TaskSummary & { labels: string[]; assignee: 
 		labels: task.labels,
 		mergeState: task.merge?.state,
 	};
+}
+
+/**
+ * Is the review quorum satisfied for this task?
+ *
+ * Pure and exported so the routing rule is testable without a socket, a container or a repo.
+ * The merge lane independently re-checks its own version of this at merge time (§3.8); this one
+ * only decides whether to move the task to `done`.
+ */
+export function reviewQuorumMet(
+	reviews: Review[],
+	author: string,
+	assignee?: string,
+): { met: boolean; reason: string } {
+	if (reviews.length === 0) return { met: false, reason: "no reviews" };
+	const pending = reviews.filter((review) => review.verdict === undefined);
+	if (pending.length > 0) return { met: false, reason: `${pending.length} review(s) still pending` };
+	const changes = reviews.filter((review) => review.verdict === "request_changes");
+	if (changes.length > 0) return { met: false, reason: `${changes.length} review(s) requested changes` };
+	const escalated = reviews.filter((review) => review.verdict === "escalate");
+	if (escalated.length > 0) return { met: false, reason: `${escalated.length} review(s) escalated` };
+	const approvals = reviews.filter((review) => review.verdict === "approve");
+	if (approvals.length === 0) return { met: false, reason: "no approving review" };
+	// Self-approval does not count. Both the creator and the current assignee are treated as the
+	// author, because a task can be reassigned after it was filed.
+	const selfApproved = approvals.every(
+		(review) => review.reviewerInstanceId === author || review.reviewerInstanceId === assignee,
+	);
+	if (selfApproved) return { met: false, reason: "only the author approved" };
+	return { met: true, reason: `${approvals.length} approval(s) from ${approvals.map((review) => review.reviewerInstanceId).join(", ")}` };
 }
 
 export { REQUEST_TIMEOUT_MS };

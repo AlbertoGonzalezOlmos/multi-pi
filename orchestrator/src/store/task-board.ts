@@ -43,6 +43,12 @@ export function assertTransition(from: TaskStatus, to: TaskStatus): void {
 
 export const EMPTY_SPENT: TaskSpent = { tokens: 0, costUsd: 0, wallMs: 0, turns: 0 };
 
+/**
+ * Statuses whose lease represents work actively in hand. Anything else is waiting on someone or
+ * something else, and reaping it would destroy that handoff.
+ */
+const REAPABLE_STATUSES: readonly TaskStatus[] = ["assigned", "in_progress"];
+
 export interface CreateTaskInput {
 	title: string;
 	body: string;
@@ -242,14 +248,22 @@ export class TaskBoard {
 		return next;
 	}
 
-	/** Reap expired leases so orphaned work returns to the queue. */
+	/**
+	 * Reap expired leases so orphaned work returns to the queue.
+	 *
+	 * Only `assigned` and `in_progress` are reapable. A task in `in_review` is waiting on a
+	 * *reviewer*, not on its lease holder, so reaping it would silently cancel the review handoff
+	 * and put the task back in the queue while a reviewer is mid-read. Same for `blocked` (waiting
+	 * on a human or a dependency) and the terminal states. Found by running the fleet: an
+	 * `in_review` task was requeued 65 minutes later and the review was orphaned.
+	 */
 	reapExpiredLeases(): Task[] {
 		const now = Date.now();
 		const reaped: Task[] = [];
 		for (const task of this.list()) {
 			if (!task.lease) continue;
 			if (new Date(task.lease.expiresAt).getTime() > now) continue;
-			if (task.status === "done" || task.status === "cancelled") continue;
+			if (!REAPABLE_STATUSES.includes(task.status)) continue;
 			const next: Task = {
 				...task,
 				lease: undefined,

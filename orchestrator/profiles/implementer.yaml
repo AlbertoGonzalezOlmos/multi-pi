@@ -2,9 +2,9 @@ name: implementer
 role: implementer
 description: Writes code in a private worktree, verifies it, and hands it to review.
 model:
-  id: moonshotai/kimi-k2.7-code
+  id: moonshotai/kimi-k3          # Kimi K3 — 1M context code model
   thinking: high
-  fallbacks: [deepseek/deepseek-v4-pro, zai/glm-5.3]
+  fallbacks: [moonshotai/kimi-k2.7-code, qwen-token-plan/kimi-k2.7-code]
 settings:
   tuiMode: regular
   quietStartup: header
@@ -15,7 +15,7 @@ context:
   agentsMd: roles/implementer.md
   appendSystem: prompts/coordination.md
 container:
-  env: [MOONSHOT_API_KEY, DEEPSEEK_API_KEY, ZAI_API_KEY, GEMINI_API_KEY]
+  env: [MOONSHOT_API_KEY, QWEN_TOKEN_PLAN_API_KEY, ZAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY]
   limits: { memory: 8g, pids: 2048, cpus: "4" }
 isolation:
   worktree: private

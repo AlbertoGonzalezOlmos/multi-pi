@@ -2,9 +2,9 @@ name: tester
 role: tester
 description: Runs the change and reports what actually happened, with commands and output.
 model:
-  id: zai/glm-5.3-flash
+  id: qwen-token-plan/deepseek-v4.1-flash  # DeepSeek V4.1
   thinking: medium
-  fallbacks: [deepseek/deepseek-flash, google/gemini-3.5-flash]
+  fallbacks: [deepseek/deepseek-v4-pro, qwen-token-plan/deepseek-v4-flash]
 settings:
   tuiMode: regular
   quietStartup: header
@@ -15,7 +15,7 @@ context:
   agentsMd: roles/tester.md
   appendSystem: prompts/coordination.md
 container:
-  env: [ZAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, MOONSHOT_API_KEY]
+  env: [QWEN_TOKEN_PLAN_API_KEY, DEEPSEEK_API_KEY, ZAI_API_KEY, GEMINI_API_KEY, MOONSHOT_API_KEY]
   limits: { memory: 6g, pids: 2048 }
 isolation:
   worktree: private

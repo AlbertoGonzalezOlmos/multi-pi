@@ -1685,6 +1685,32 @@ Each of these was a real defect that reasoning did not catch:
 8. **`fsync` vs `fsyncSync`** — the callback API takes two arguments, so the atomic write was not
    actually fsyncing.
 
+Found later, by running a real four-instance fleet (§10) rather than by review:
+
+9. **Git worktrees were unusable inside containers.** A worktree's `.git` is a *file* reading
+   `gitdir: <absolute host path>/.git/worktrees/<id>`, and that path was not mounted, so every git
+   command failed with "not a git repository" and the author could not commit its own work. Fixed by
+   mounting the base repo's `.git` at the **identical absolute path** (`--userns=keep-id` already
+   makes uids match). The implementer found this, correctly refused to rewrite the pointer or
+   `git init` a replacement, and escalated — which is the role card working as intended.
+   *Residual risk, stated plainly:* this gives a writer container the shared object database and
+   refs, so a confused agent could in principle move a ref. That is inherent to git worktrees. What
+   it does not give is a writable base working tree: reviewers and the parent still mount that
+   `:ro` with no `.git` at all, and the merge lane re-checks every precondition host-side.
+10. **The lease reaper requeued a task that was `in_review`.** The lease lapsed while the reviewer
+    was reading, so the task went back to `queued` and the routed review was orphaned. Fixed: only
+    `assigned` and `in_progress` are reapable — every other status is waiting on someone else — and
+    a `busy` heartbeat now renews the lease, so long tasks are not reaped out from under an agent
+    that is doing exactly what it was asked to do.
+11. **Nothing moved `in_review` → `done` on approval**, so the merge lane (which only drains `done`
+    tasks) never fired. §3.4 specified that step; it simply was not implemented. Fixed with a pure,
+    tested `reviewQuorumMet()` plus `applyReviewOutcome()`, and a `reconcileReviews()` pass in the
+    daemon tick so a verdict recorded while the daemon was down still lands.
+12. **The CLI did not correlate responses by id.** It took the first record after `hello`, which is
+    usually a broadcast event (`peer.joined`, `task.changed`), so it reported "failed" for work that
+    had actually succeeded. This is the exact mistake §1.2 item 7 warns about for `RpcClient`,
+    reproduced in my own client.
+
 ### Not yet built
 
 - `extensions/fleet-orchestrator/` — the parent-side extension (fleet dashboard, `spawn_harness`,
@@ -1698,3 +1724,81 @@ Each of these was a real defect that reasoning did not catch:
 - The faux-provider test image (Phase 5.2), so the fleet tests still spend real tokens.
 - `multy recover` after a host reboot, and merge-lane crash reconciliation (Phase 5.5).
 - Packaging as a pi package (Phase 6.1).
+
+
+---
+
+## 10. First real fleet run
+
+Executed against a scratch repository (`~/multy-demo/project`, a 30-line retry helper with a
+deliberate defect) so the auto-merge lane could not touch anything real. Four instances, four model
+families, all four requested models:
+
+| Instance | Role | Model | `/work` |
+|---|---|---|---|
+| `parent` | orchestrator | `zai/glm-5.3` (GLM 5.3) | base, ro |
+| `implementer` | implementer | `moonshotai/kimi-k3` (Kimi K3) | private worktree, rw |
+| `reviewer` | reviewer | `qwen-token-plan/qwen3.8-max` (Qwen3.8-Max) | base, ro |
+| `tester` | tester | `qwen-token-plan/deepseek-v4.1-flash` (DeepSeek V4.1) | private worktree, rw |
+
+All four spawned, joined the bus, and rendered their own pi TUI in their own tmux window with the
+correct model in the footer (`(moonshotai) kimi-k3 • high`, `(qwen-token-plan) qwen3.8-max • xhigh`,
+…) and the fleet widget above the editor.
+
+**The task:** make `retry()` honour its `AbortSignal`, and add tests.
+
+**What happened, without operator intervention after seeding the task:**
+
+1. `implementer` (Kimi K3) claimed it, moved it to `in_progress`, implemented the four abort
+   behaviours, wrote tests, ran them (**7 pass, ~193 ms**), and committed on `fleet/implementer`
+   with explicit paths.
+2. The daemon routed the review to `reviewer` and recorded `crossFamily: true` in the decision —
+   author on Moonshot, reviewer on Qwen.
+3. `reviewer` (Qwen3.8-Max) did not merely read the diff. It copied the tree to `/tmp`, used
+   `git -C /work show <sha>:src/retry.ts` to extract the pre-fix version, and ran **mutation
+   testing**: with the fix reverted, 5 of 7 tests failed, proving the tests were not vacuous. It
+   then filed a **blocking** finding — the `test` script was `node --test 'test/*.test.ts'`, whose
+   quoted glob is not expanded by node and whose literal quotes break on `cmd.exe`, so it could
+   false-green — and recommended `node --test` auto-discovery.
+4. `implementer` addressed the findings in a second commit.
+5. `reviewer` re-reviewed each round-1 finding one by one and **approved** (89.5k tokens of review).
+6. The merge lane checked its preconditions and integrated the work as a `--no-ff` merge:
+
+```
+*   50d6db8 fleet(task_760141f3): retry(): honour the abort signal, and add tests
+|\
+| * 675520a fix: address review findings on retry() abort support
+| * f100952 fix: honour AbortSignal in retry() and add node:test coverage
+|/
+* 3669ecd initial: retry helper with a known defect
+```
+
+Two parents, so `git revert -m 1 50d6db8` undoes exactly this task. **8 tests pass on `main`** after
+the merge. Total spend: **$0.17** (implementer); the `qwen-token-plan` provider reports no cost, so
+the reviewer's 89.5k tokens are plan-priced and show as $0.0000 — cost accounting is only as good as
+the provider's reporting.
+
+Also exercised, incidentally: the daemon was restarted mid-run and **all four bridges reconnected
+and resynchronised from the store**, and the reconcile pass then completed the review→merge handoff
+that had been missed.
+
+### What this run proved and what it did not
+
+Proved: per-instance models and terminals; bridge injection into a live conversation; cross-family
+review routing; a review with enough independence to catch a real defect the author missed; the
+eight-precondition merge lane; `--no-ff` revertability; bus reconnect resynchronisation; usage and
+decision audit trails.
+
+Not proved, and worth saying so:
+
+- **The parent model never actually orchestrated.** It came up, read the workspace with its own
+  tools when the implementer escalated, and idled. Priorities, assignment and the review handoff
+  were all driven by the daemon and one operator command. The `fleet-orchestrator` extension is
+  still unbuilt, so "the parent decides priorities" is unverified.
+- **`tester` never ran.** No verification task was created, so `merge.requireVerifyLabel` was never
+  exercised end to end.
+- **One review round overwrote the previous one.** Round 2 reused review id
+  `rev_<task>_<reviewer>`, so the store holds only the final verdict; round-1 findings survive only
+  inside the reviewer's own prose. Review rounds should accumulate, not replace.
+- **No conflict, revert, hold, or budget path was exercised live.** All four are unit-tested against
+  throwaway repos, but not observed in a running fleet.

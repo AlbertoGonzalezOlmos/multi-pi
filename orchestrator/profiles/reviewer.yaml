@@ -5,9 +5,9 @@ name: reviewer
 role: reviewer
 description: Reads diffs and reports findings with file:line evidence. Never edits code.
 model:
-  id: google/gemini-3.5-flash
+  id: qwen-token-plan/qwen3.8-max  # Qwen3.8-Max — different family from the implementer
   thinking: high
-  fallbacks: [google/gemini-3.1-flash-lite, deepseek/deepseek-flash]
+  fallbacks: [qwen-token-plan/qwen3.8-flash, google/gemini-3.5-flash]
 tools: [read, grep, find, ls, bash]
 settings:
   tuiMode: regular
@@ -19,7 +19,7 @@ context:
   agentsMd: roles/reviewer.md
   appendSystem: prompts/coordination.md
 container:
-  env: [GEMINI_API_KEY, DEEPSEEK_API_KEY, ZAI_API_KEY, MOONSHOT_API_KEY]
+  env: [QWEN_TOKEN_PLAN_API_KEY, GEMINI_API_KEY, MOONSHOT_API_KEY, ZAI_API_KEY, DEEPSEEK_API_KEY]
   limits: { memory: 4g, pids: 512 }
 isolation:
   worktree: shared-readonly

@@ -26,6 +26,8 @@ usage:
   multy spawn PROFILE [--id ID] [--model M] [--root DIR] [--no-window] [--print "PROMPT"]
   multy status [--root DIR] [--json] [--watch]
   multy tasks [--root DIR] [--json]
+  multy task-new "TITLE" --body "MD" [--label code] [--priority N] [--assignee ID]
+                     [--depends-on id1,id2] [--root DIR]
   multy logs ID [--source container|pane|tui|bridge] [--tail N] [--root DIR]
   multy capture ID [--scrollback] [--root DIR]
   multy stop ID [--remove] [--root DIR]
@@ -465,6 +467,50 @@ async function commandImage(parsed: Parsed): Promise<number> {
 	return 0;
 }
 
+async function commandTaskNew(parsed: Parsed): Promise<number> {
+	const root = resolveRoot(parsed);
+	requireManifest(root);
+	const title = parsed.positionals.join(" ").trim();
+	const body = flagString(parsed, "body");
+	if (!title || !body) {
+		console.error('usage: multy task-new "TITLE" --body "MARKDOWN" [--label code] [--priority N] [--assignee ID]');
+		return 2;
+	}
+	const labels = (flagString(parsed, "label") ?? "").split(",").map((label) => label.trim()).filter(Boolean);
+	const dependsOn = (flagString(parsed, "depends-on") ?? "").split(",").map((id) => id.trim()).filter(Boolean);
+	const response = (await requestViaSocket(root, {
+		type: "task.create",
+		payload: {
+			title,
+			body,
+			labels,
+			priority: flagString(parsed, "priority") === undefined ? undefined : Number(flagString(parsed, "priority")),
+			dependsOn,
+		},
+	})) as { ok?: boolean; payload?: { task?: { id: string; status: string; priority: number } }; error?: string };
+	if (!response.ok || !response.payload?.task) {
+		console.error(`task creation failed: ${response.error ?? "unknown"}`);
+		return 1;
+	}
+	const task = response.payload.task;
+	out(`created ${task.id} [${task.status}] p${task.priority}: ${title}`);
+	const assignee = flagString(parsed, "assignee");
+	if (assignee) {
+		const directed = await requestViaSocket(root, {
+			type: "message.post",
+			payload: {
+				to: assignee,
+				kind: "handoff",
+				subject: task.id,
+				requiresAck: true,
+				body: `You are assigned task ${task.id}: ${title}\n\n${body}\n\nClaim it with task_claim, mark it in_progress, and when the work is verified mark it in_review.`,
+			},
+		});
+		out(`directed to ${assignee}: ${JSON.stringify(directed)}`);
+	}
+	return 0;
+}
+
 async function commandDoctor(parsed: Parsed): Promise<number> {
 	const root = resolveRoot(parsed);
 	const manager = managerFor(root);
@@ -501,12 +547,22 @@ async function commandLedger(parsed: Parsed): Promise<number> {
 // ---------------------------------------------------------------------------
 
 /**
- * Send one request to a running daemon's bus socket. Used by the operator-facing post/inject
- * commands so they do not need to bind the socket themselves.
- *
- * Authenticates with the host-only operator token (never mounted into a container), so the daemon
- * registers us as the pseudo-instance "operator".
+ * Send one request to a running daemon's bus socket, authenticating with the host-only operator
+ * token (never mounted into a container), so the daemon registers us as the pseudo-instance
+ * "operator".
  */
+async function requestViaSocket(
+	root: string,
+	request: { type: string; payload: unknown },
+	timeoutMs = 15_000,
+): Promise<unknown> {
+	const store = new WorkspaceStore(root);
+	return postViaSocket(join(store.paths.run, "bus.sock"), managerFor(root).operatorToken(), {
+		...request,
+		from: "operator",
+	}, timeoutMs);
+}
+
 async function postViaSocket(
 	socketPath: string,
 	operatorToken: string | undefined,
@@ -518,6 +574,11 @@ async function postViaSocket(
 		const socket = createConnection(socketPath);
 		let buffer = "";
 		let helloAcked = false;
+		// Correlate by id. The daemon broadcasts events (peer.joined, task.changed) to every
+		// connection, so the first record after hello is often someone else's event, not our
+		// response. Taking it at face value silently reports failure for work that succeeded.
+		const requestId = `cli_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+		const helloId = `cli_hello_${Date.now()}`;
 		const timer = setTimeout(() => {
 			socket.destroy();
 			reject(new Error("timed out waiting for the daemon"));
@@ -527,7 +588,7 @@ async function postViaSocket(
 			socket.write(
 				`${JSON.stringify({
 					v: 1,
-					id: `cli_hello_${Date.now()}`,
+					id: helloId,
 					from: request.from,
 					kind: "req",
 					type: "hello",
@@ -555,15 +616,17 @@ async function postViaSocket(
 				buffer = buffer.slice(newline + 1);
 				newline = buffer.indexOf("\n");
 				if (!line.trim()) continue;
-				let record: { kind?: string; ok?: boolean; error?: string };
+				let record: { id?: string; kind?: string; ok?: boolean; error?: string };
 				try {
 					record = JSON.parse(line) as typeof record;
 				} catch {
 					continue;
 				}
 				if (!helloAcked) {
+					// Ignore events that arrive before our own hello response.
+					if (record.kind !== "res" || record.id !== helloId) continue;
 					helloAcked = true;
-					if (record.kind === "res" && record.ok !== true) {
+					if (record.ok !== true) {
 						clearTimeout(timer);
 						socket.destroy();
 						reject(new Error(`operator authentication failed: ${record.error ?? "unknown"}`));
@@ -572,7 +635,7 @@ async function postViaSocket(
 					socket.write(
 						`${JSON.stringify({
 							v: 1,
-							id: `cli_${Date.now()}`,
+							id: requestId,
 							from: request.from,
 							kind: "req",
 							type: request.type,
@@ -581,6 +644,7 @@ async function postViaSocket(
 					);
 					continue;
 				}
+				if (record.kind !== "res" || record.id !== requestId) continue;
 				clearTimeout(timer);
 				socket.end();
 				try {
@@ -629,6 +693,8 @@ async function main(): Promise<number> {
 			return commandStatus(parsed);
 		case "tasks":
 			return commandTasks(parsed);
+		case "task-new":
+			return commandTaskNew(parsed);
 		case "logs":
 			return commandLogs(parsed);
 		case "capture":

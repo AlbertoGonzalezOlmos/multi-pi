@@ -205,6 +205,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 			const reaped = board.reapExpiredLeases();
 			for (const task of reaped) log(`lease reaped: ${task.id}`);
 
+			// 3b. Advance any task whose review quorum was met while we were not looking (a daemon
+			// restart, or a verdict recorded before this reconcile existed).
+			for (const taskId of bus.reconcileReviews()) log(`review quorum met, ${taskId} -> done`);
+
 			// 4. Budgets, enforced here rather than by the model.
 			for (const instance of store.listInstances()) {
 				checkBudget(instance);

@@ -240,6 +240,23 @@ export class FleetManager {
 			{ host: this.store.paths.workspace, container: DEFAULT_PATHS.workspace, mode: "rw" as const },
 			{ host: this.store.paths.run, container: "/fleet/run", mode: "rw" as const },
 		];
+		// A git worktree's `.git` is a FILE containing `gitdir: <absolute host path>/.git/worktrees/<id>`.
+		// Without that path present in the container, every git command fails with "not a git
+		// repository" and the author cannot commit its own work — found by running the fleet, when
+		// the implementer correctly refused to rewrite the pointer or `git init` a replacement.
+		//
+		// So mount the base repo's .git at the IDENTICAL absolute path. `--userns=keep-id` already
+		// makes host and container uids match, and the paths are unchanged, so the pointer resolves.
+		//
+		// Tradeoff, stated plainly: this gives a writer container the shared object database and
+		// refs, so a confused agent could in principle move a ref. That is inherent to git worktrees
+		// (they share one object store). What it does NOT give is a writable base working tree —
+		// reviewers and the parent still mount that `:ro` and get no .git at all, and the merge lane
+		// re-checks every precondition at merge time on the host.
+		const baseGitDir = join(manifest.projectRoot, ".git");
+		if (worktreeMode === "private" && existsSync(baseGitDir)) {
+			mounts.push({ host: baseGitDir, container: baseGitDir, mode: "rw" });
+		}
 		// In bake mode the bridge comes from the image; in bind mode mount it live so edits need
 		// no rebuild. The daemon refuses a fleet that mixes the two (§3.5).
 		if (bridgeSource === "bind") {

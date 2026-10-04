@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { TaskBoard, canTransition, assertTransition, DependencyCycleError, findCycleWithEdge } from "../src/store/task-board.ts";
+import { reviewQuorumMet } from "../src/bus/daemon.ts";
 import { WorkspaceStore } from "../src/store/workspace-store.ts";
 import type { TaskStatus } from "../src/bus/protocol.ts";
 
@@ -239,6 +240,42 @@ test("reapExpiredLeases requeues orphaned work", () => {
 	}
 });
 
+test("REGRESSION: a task in_review is NOT reaped when its lease expires", () => {
+	// Found by running the fleet: the implementer moved its task to in_review, the 10-minute lease
+	// lapsed while the reviewer was reading, and the reaper put the task back in the queue —
+	// silently orphaning the review that the daemon had already routed.
+	const { board, store, cleanup } = makeBoard();
+	try {
+		const task = board.create({ title: "t", body: "b", createdBy: "impl" });
+		board.claim(task.id, "impl", -1);
+		board.transition(task.id, "in_progress", "impl");
+		board.transition(task.id, "in_review", "impl");
+
+		const reaped = board.reapExpiredLeases();
+		assert.deepEqual(reaped, [], "in_review is waiting on a reviewer, not on its lease holder");
+		const after = board.require(task.id);
+		assert.equal(after.status, "in_review");
+		assert.equal(after.assignee, "impl", "the author must stay recorded so request_changes routes back");
+
+		// The same holds for blocked, and for the terminal states.
+		for (const status of ["blocked", "done", "cancelled"] as const) {
+			const other = board.create({ title: `t-${status}`, body: "b", createdBy: "impl" });
+			board.claim(other.id, "impl", -1);
+			store.writeTask({ ...board.require(other.id), status });
+			assert.deepEqual(board.reapExpiredLeases(), [], `${status} must not be reaped`);
+			assert.equal(board.require(other.id).status, status);
+		}
+
+		// And an actively-held task IS still reaped, or crash recovery stops working.
+		const live = board.create({ title: "live", body: "b", createdBy: "impl" });
+		board.claim(live.id, "impl", -1);
+		board.transition(live.id, "in_progress", "impl");
+		assert.equal(board.reapExpiredLeases().length, 1);
+	} finally {
+		cleanup();
+	}
+});
+
 test("budget accounting and overrun detection", () => {
 	const { board, cleanup } = makeBoard();
 	try {
@@ -346,4 +383,44 @@ test("DependencyCycleError carries the cycle path", () => {
 	assert.equal(error.name, "DependencyCycleError");
 	assert.deepEqual(error.cycle, ["a", "b", "a"]);
 	assert.match(error.message, /a -> b -> a/);
+});
+
+// ---------------------------------------------------------------------------
+// Review quorum routing (src/bus/daemon.ts reviewQuorumMet)
+//
+// This is the step that moves a task from in_review to done so the merge lane can see it.
+// Found missing by running the fleet: a review was approved and nothing happened for ten minutes.
+// ---------------------------------------------------------------------------
+
+test("reviewQuorumMet routing rules", () => {
+	const review = (verdict: string | undefined, reviewer = "reviewer") =>
+		({ id: `r_${reviewer}_${verdict}`, verdict, reviewerInstanceId: reviewer }) as never;
+
+	// No reviews at all.
+	assert.equal(reviewQuorumMet([], "impl").met, false);
+
+	// Still pending.
+	assert.equal(reviewQuorumMet([review("approve"), review(undefined, "r2")], "impl").met, false);
+
+	// A single change request blocks even alongside an approval.
+	const blocked = reviewQuorumMet([review("approve"), review("request_changes", "r2")], "impl");
+	assert.equal(blocked.met, false);
+	assert.match(blocked.reason, /requested changes/);
+
+	// Escalation blocks and is routed to the parent instead.
+	assert.equal(reviewQuorumMet([review("escalate", "r2")], "impl").met, false);
+
+	// Self-approval does not count, by creator or by current assignee.
+	assert.equal(reviewQuorumMet([review("approve", "impl")], "impl").met, false);
+	assert.equal(reviewQuorumMet([review("approve", "impl")], "someone-else", "impl").met, false);
+
+	// A genuine cross-instance approval passes.
+	const ok = reviewQuorumMet([review("approve", "reviewer")], "impl");
+	assert.equal(ok.met, true);
+	assert.match(ok.reason, /reviewer/);
+
+	// Two approvals still pass, and the reason names both.
+	const two = reviewQuorumMet([review("approve", "r1"), review("approve", "r2")], "impl");
+	assert.equal(two.met, true);
+	assert.match(two.reason, /r1, r2/);
 });
