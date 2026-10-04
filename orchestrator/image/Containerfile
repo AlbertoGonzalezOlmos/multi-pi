@@ -1,0 +1,64 @@
+# multi-pi subharness image.
+#
+# Baking pi, fd/rg and the model catalog into the image removes three verified concurrency
+# hazards (PLAN.md §1.4):
+#   - fd/rg are downloaded on demand into <agent-dir>/bin with a renameSync race
+#     (pi/packages/coding-agent/src/utils/tools-manager.ts:10-18)
+#   - `pi install`/`update` write to a shared <agent-dir>/npm cache
+#     (pi/packages/coding-agent/src/core/package-manager.ts:2093+)
+#   - concurrent model-catalog refreshes write the same models-store.json
+# With PI_OFFLINE=1 and everything pre-baked, none of those paths run at all.
+
+FROM docker.io/library/node:22-slim
+
+# tmux runs INSIDE the container as the permanent holder of pi's PTY, so a human attaching and
+# detaching (or the host tmux server dying entirely) never delivers SIGHUP to pi. Verified:
+# without it, closing the attach client kills pi within ~2s.
+#
+# locales gives us C.UTF-8. This is load-bearing, not cosmetic: with LC_CTYPE=POSIX, tmux falls
+# back to DEC Special Graphics line drawing, and pi's box-drawing borders render as runs of `q`
+# through a nested attach. Setting LANG=C.UTF-8 removes that entirely.
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      git \
+      ripgrep \
+      fd-find \
+      ca-certificates \
+      curl \
+      procps \
+      openssh-client \
+      tmux \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+# Pin the pi version. Three different pi copies exist on the host (PLAN.md §1.9); baking one into
+# the image makes version skew across the fleet impossible (§6.6).
+ARG PI_VERSION=1.0.0
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@${PI_VERSION} \
+ && npm cache clean --force
+
+# Warm the model catalog so PI_OFFLINE=1 still lists models (verified: Spike 5).
+RUN pi --list-models >/dev/null 2>&1 || true
+
+COPY tmux.conf /etc/tmux.conf
+
+ENV PI_OFFLINE=1 \
+    PI_SKIP_VERSION_CHECK=1 \
+    PI_TELEMETRY=0 \
+    TERM=xterm-256color \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PI_CODING_AGENT_DIR=/agent
+
+# node:22-slim inherits docker-entrypoint.sh, which prepends `node` to any first argument that
+# starts with "-" or does not end in .js. Since the orchestrator passes pi's FLAGS as the container
+# command, that script would turn `-a --tui-mode ...` into `node -a ...` and pi would die with
+# "node: bad option: -a". The orchestrator therefore always runs the container with
+# `--entrypoint`, bypassing the inherited script. Do NOT set ENTRYPOINT here: an explicitly empty
+# `ENTRYPOINT []` makes podman consume the first run argument as the entrypoint.
+
+WORKDIR /work
+
+# The orchestrator supplies the real command: a bash wrapper that starts pi inside an inner tmux
+# session and blocks for as long as that session lives.
+CMD ["pi"]

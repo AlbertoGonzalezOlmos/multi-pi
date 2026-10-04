@@ -1,0 +1,41 @@
+# Deliberately a different model family from the implementers, so cross-family review is the
+# default rather than an aspiration (PLAN.md §3.4). Read-only tools and a read-only base mount:
+# a reviewer cannot edit even by accident.
+name: reviewer
+role: reviewer
+description: Reads diffs and reports findings with file:line evidence. Never edits code.
+model:
+  id: google/gemini-3.5-flash
+  thinking: high
+  fallbacks: [google/gemini-3.1-flash-lite, deepseek/deepseek-flash]
+tools: [read, grep, find, ls, bash]
+settings:
+  tuiMode: regular
+  quietStartup: header
+  defaultProjectTrust: always
+  terminal: { showTerminalProgress: true }
+  defaultTools: [read, grep, find, ls, bash]
+context:
+  agentsMd: roles/reviewer.md
+  appendSystem: prompts/coordination.md
+container:
+  env: [GEMINI_API_KEY, DEEPSEEK_API_KEY, ZAI_API_KEY, MOONSHOT_API_KEY]
+  limits: { memory: 4g, pids: 512 }
+isolation:
+  worktree: shared-readonly
+terminal:
+  backend: tmux+podman-attach
+  size: { cols: 130, rows: 42 }
+  title: "review · {model} · {task}"
+budget:
+  tokens: 800000
+  costUsd: 4
+  wallMinutes: 120
+  maxTurns: 150
+coordination:
+  autoReview: true
+  wipLimit: 1
+  heartbeatSeconds: 20
+  maxDepth: 1
+bridge:
+  source: bind

@@ -1,0 +1,40 @@
+# The orchestrator. Biggest context budget of the fleet because it accumulates coordination
+# history; 1M-token model chosen deliberately (PLAN.md §6.5).
+name: parent
+role: parent
+description: Coordinates the fleet — decides priorities, splits work, judges quality.
+model:
+  id: zai/glm-5.3
+  thinking: high
+  fallbacks: [zai/glm-5.2, google/gemini-3.1-pro-preview]
+settings:
+  tuiMode: regular
+  quietStartup: header
+  defaultProjectTrust: always
+  terminal: { showTerminalProgress: true }
+  compaction: { enabled: true, keepRecentTokens: 40000 }
+context:
+  agentsMd: roles/parent.md
+  appendSystem: prompts/coordination.md
+container:
+  # Credential env var NAMES only. Values are forwarded from the daemon's environment and are
+  # never written to disk (verified: Spike 5).
+  env: [ZAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, MOONSHOT_API_KEY]
+  limits: { memory: 6g, pids: 1024 }
+isolation:
+  # The parent gets the base tree READ-ONLY. It has full tools, but it cannot integrate code
+  # itself — only the host-side merge lane can (PLAN.md §6.11).
+  worktree: shared-readonly
+terminal:
+  backend: tmux+podman-attach
+  size: { cols: 150, rows: 46 }
+  title: "parent · {model} · {task}"
+budget:
+  tokens: 4000000
+  costUsd: 20
+  wallMinutes: 480
+coordination:
+  heartbeatSeconds: 20
+  maxDepth: 0
+bridge:
+  source: bind

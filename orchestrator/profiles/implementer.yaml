@@ -1,0 +1,37 @@
+name: implementer
+role: implementer
+description: Writes code in a private worktree, verifies it, and hands it to review.
+model:
+  id: moonshotai/kimi-k2.7-code
+  thinking: high
+  fallbacks: [deepseek/deepseek-v4-pro, zai/glm-5.3]
+settings:
+  tuiMode: regular
+  quietStartup: header
+  defaultProjectTrust: always
+  terminal: { showTerminalProgress: true }
+  defaultTools: [read, bash, edit, write, grep, find, ls]
+context:
+  agentsMd: roles/implementer.md
+  appendSystem: prompts/coordination.md
+container:
+  env: [MOONSHOT_API_KEY, DEEPSEEK_API_KEY, ZAI_API_KEY, GEMINI_API_KEY]
+  limits: { memory: 8g, pids: 2048, cpus: "4" }
+isolation:
+  worktree: private
+terminal:
+  backend: tmux+podman-attach
+  size: { cols: 140, rows: 44 }
+  title: "impl · {model} · {task}"
+budget:
+  tokens: 2000000
+  costUsd: 10
+  wallMinutes: 240
+  maxTurns: 400
+coordination:
+  autoClaim: true
+  wipLimit: 1
+  heartbeatSeconds: 20
+  maxDepth: 1
+bridge:
+  source: bind
